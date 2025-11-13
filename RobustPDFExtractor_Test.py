@@ -1,6 +1,7 @@
 import re
 import boto3
 import nltk
+import pdfplumber
 from PyPDF2 import PdfReader
 from PyPDF2.errors import PdfReadError
 from gibberish_detector import detector
@@ -270,12 +271,367 @@ class RobustPDFExtractor_Test:
 
         return final_score
 
-if __name__ == '__main__':
-    # logging.basicConfig(level=logging.INFO)
-    extractor = RobustPDFExtractor_Test()
+    def _convert_table_to_markdown(self, table_data: List[List[Optional[str]]]) -> str:
+        """
+        Converts a list-of-lists table into a Markdown string.
+        """
+        if not table_data:
+            return ""
 
-    # Extract text and tables together
-    print("\n=== Complete Extraction (Text + Tables) ===")
-    extractionResult = extractor._pypdf_extract('./pdfs/sample-tables2.pdf')
-    print(extractionResult)
+        # Create header row
+        header = "| " + " | ".join(str(h) for h in table_data) + " |"
+        # Create separator row
+        separator = "| " + " | ".join(["---"] * len(table_data)) + " |"
+        # Create data rows
+        rows = [
+            "| " + " | ".join(str(cell) if cell is not None else "" for cell in row) + " |"
+            for row in table_data[1:]]
+
+        return "\n".join([header, separator] + rows)
+
+    def _calculate_pdfplumber_confidence(self, full_text: str) -> float:
+        """
+        Calculates confidence for Stage 2.
+        The main check is: did we get non-garbled text?
+        """
+        if not full_text.strip():
+            return 0.0  # No text extracted, definitely a scanned PDF.
+
+        # Re-use the Stage 1 garbled text detector
+        garbled_score = self._check_for_garbled_text(full_text)
+
+        return garbled_score
+
+    def _pdfplumber_extract(self, pdf_path: str) -> ExtractionResult:
+        """
+        Stage 2: Structure-aware extraction using pdfplumber.
+        """
+        all_text = []
+        page_texts = {}
+        tables = []
+        headers = []
+        total_pages = 0
+
+        # These are settings for "borderless" tables [32, 33]
+        table_settings = {
+            "vertical_strategy": "text",
+            "horizontal_strategy": "text",
+            "snap_tolerance": 4,
+        }
+
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                total_pages = len(pdf.pages)
+
+                for i, page in enumerate(pdf.pages):
+                    page_num = i + 1
+
+                    # 1. Extract layout-aware text
+                    # The x_tolerance helps respect column boundaries [35]
+                    text = page.extract_text(x_tolerance=3, y_tolerance=3)
+                    if text is None:
+                        text = ""
+
+                    all_text.append(text)
+                    page_texts[page_num] = text
+
+                    # 2. Extract tables
+                    extracted_tables = page.extract_tables(table_settings=table_settings)
+                    for tbl_list in extracted_tables:
+                        if not tbl_list:
+                            continue
+
+                        md_table = self._convert_table_to_markdown(tbl_list)
+                        tables.append(ExtractedTable(
+                            page_number=page_num,
+                            as_list=tbl_list,
+                            as_markdown=md_table,
+                            extractor="pdfplumber"
+                        ))
+
+                    # 3. Extract Headers
+                    headers.extend(
+                        self._find_headers_with_pdfplumber(page)
+                    )
+
+            full_text = "\n\n".join(all_text)
+
+            # Calculate confidence for this stage
+            confidence = self._calculate_pdfplumber_confidence(
+                full_text=full_text
+            )
+
+            return ExtractionResult(
+                full_text=full_text,
+                page_texts=page_texts,
+                tables=tables,
+                headers=headers,
+                extractor_used="pdfplumber",
+                confidence_score=confidence,
+                total_pages=total_pages
+            )
+        except Exception as e:
+            print(f"pdfplumber failed: {e}")
+            return ExtractionResult(
+                full_text="",
+                page_texts={},
+                extractor_used="pdfplumber",
+                confidence_score=0.0,  # Failed, move to Stage 3
+                total_pages=0
+            )
+
+    def _get_body_font_stats(self, page: pdfplumber.page.Page, min_chars: int = 100) -> (float, str):
+        """
+        Helper to find the most common (body) font size and name.
+        """
+        try:
+            # Get font sizes and names from character data
+            sizes = [
+                char['size'] for char in page.chars
+                if 'size' in char and char['text'].strip()
+            ]
+            names = [
+                char['fontname'] for char in page.chars
+                if 'fontname' in char and char['text'].strip()
+            ]
+
+            if len(sizes) < min_chars:
+                return (10.0, "default")  # Not enough data, return a sensible default
+
+            # Find the most common font size (mode)
+            body_size = max(set(sizes), key=sizes.count)
+            # Find the most common font name (mode)
+            body_name = max(set(names), key=names.count)
+
+            return (body_size, body_name)
+        except Exception:
+            return (10.0, "default")  # Fallback
+
+    def _find_headers_with_pdfplumber(self, page: pdfplumber.page.Page) -> List[ExtractedHeader]:
+        """
+        Infers headers by analyzing font sizes.
+        Heuristic: Headers are lines with font size > body font size,
+        or a "Bold" font name.[35, 37, 38]
+        """
+        headers = []
+        body_size, body_name = self._get_body_font_stats(page)
+
+        # Define thresholds
+        size_threshold = body_size * 1.15  # e.g., 11.5pt if body is 10pt
+
+        # group_lines combines chars into lines
+        for line in page.lines:
+            line_text = line['text'].strip()
+            if not line_text:
+                continue
+
+            # Get the font size/name of the *first char* in the line
+            first_char = line['chars']
+            line_size = first_char.get('size', body_size)
+            line_name = first_char.get('fontname', body_name)
+
+            is_header = False
+            level = 0
+
+            # Heuristic 1: Font name contains "Bold"
+            if "bold" in line_name.lower():
+                is_header = True
+                level = 2  # Assume bold is H2
+
+            # Heuristic 2: Font size is significantly larger than body
+            if line_size > size_threshold:
+                is_header = True
+                if line_size > size_threshold * 1.2:  # e.g., > 13.8pt
+                    level = 1  # H1
+                else:
+                    level = 2  # H2
+
+            if is_header:
+                headers.append(ExtractedHeader(
+                    text=line_text,
+                    page_number=page.page_number,
+                    level=level,
+                    font_size=line_size,
+                    font_name=line_name,
+                    extractor="pdfplumber"
+                ))
+
+        return headers
+
+    def _textract_extract(self, pdf_path: str) -> ExtractionResult:
+        """
+        Stage 3: "Nuclear Option" using AWS Textract for OCR and
+        structural analysis.
+        """
+        print(f"Falling back to AWS Textract for {pdf_path}...")
+        try:
+            with open(pdf_path, 'rb') as f:
+                pdf_bytes = f.read()
+
+            # Use analyze_document for structural data [12, 40]
+            response = self.textract_client.analyze_document(
+                Document={'Bytes': pdf_bytes},
+                FeatureTypes=  # Essential! [39]
+            )
+
+            # The Textract JSON response is complex [22, 44]
+            # We must parse it into our standard ExtractionResult.
+            return self._parse_textract_response(response)
+
+        except ClientError as e:
+            print(f"AWS Textract ClientError: {e}")
+            return ExtractionResult(
+                full_text="",
+                page_texts={},
+                extractor_used="textract",
+                confidence_score=0.0,  # Failed
+                total_pages=0,
+                raw_response=str(e)
+            )
+        except Exception as e:
+            print(f"Unhandled Textract error: {e}")
+            return ExtractionResult(
+                full_text="",
+                page_texts={},
+                extractor_used="textract",
+                confidence_score=0.0,
+                total_pages=0,
+                raw_response=str(e)
+            )
+
+    def _parse_textract_response(self, response: dict) -> ExtractionResult:
+        """
+        Parses the complex Textract JSON response into our
+        standard ExtractionResult using the official parser library.[45, 47]
+        """
+        all_text = []
+        page_texts = {}
+        tables = []
+        headers = []
+
+        doc = Parser(response)  # Use the parser library
+        total_pages = len(doc.pages)
+
+        for i, page in enumerate(doc.pages):
+            page_num = i + 1
+
+            # 1. Extract Text
+            # We join lines to reconstruct page text
+            page_text = "\n".join([line.text for line in page.lines])
+            all_text.append(page_text)
+            page_texts[page_num] = page_text
+
+            # 2. Extract Tables
+            # The parser library reconstructs tables [47]
+            for table in page.tables:
+                # Convert Textract's table object to list-of-lists
+                tbl_list =
+                for r_idx, row in enumerate(table.rows):
+                    row_list =
+                    for c_idx, cell in enumerate(row.cells):
+                        row_list.append(cell.text)
+                    tbl_list.append(row_list)
+
+                if not tbl_list:
+                    continue
+
+                md_table = self._convert_table_to_markdown(tbl_list)
+                tables.append(ExtractedTable(
+                    page_number=page_num,
+                    as_list=tbl_list,
+                    as_markdown=md_table,
+                    confidence=table.confidence,
+                    extractor="textract"
+                ))
+
+            # 3. Extract "Headers" (from FORMS)
+            # We can infer headers from Form Key-Value pairs [12]
+            for field in page.form.fields:
+                if field.key and not field.value:
+                    # If a "key" has no "value", it's often a title or header
+                    headers.append(ExtractedHeader(
+                        text=field.key.text,
+                        page_number=page_num,
+                        level=3,  # Assume H3 for form keys
+                        font_size=12.0,  # Not available, use default
+                        font_name="N/A",  # Not available
+                        extractor="textract"
+                    ))
+
+        full_text = "\n\n".join(all_text)
+
+        # Stage 3 is the end of the line. Confidence is always 1.0.
+        # This is the "ground truth" for this pipeline.
+        return ExtractionResult(
+            full_text=full_text,
+            page_texts=page_texts,
+            tables=tables,
+            headers=headers,
+            extractor_used="textract",
+            confidence_score=1.0,
+            total_pages=total_pages,
+            raw_response=response
+        )
+
+
+# --- Example Usage ---
+if __name__ == "__main__":
+    # Create two extractor instances to demonstrate
+
+    # 1. Standard 3-Stage Extractor (no Marker)
+    # This is the user's requested implementation
+    print("--- Initializing Standard 3-Stage Extractor ---")
+    standard_extractor = RobustPDFExtractor_Test(use_marker=False)
+
+    # 2. Specialist Extractor (with Marker)
+    # This is the recommended architecture for technical docs
+    print("\n--- Initializing Specialist Extractor (with Marker) ---")
+    # Set use_marker=True to load the models
+    specialist_extractor = RobustPDFExtractor_Test(use_marker=True)
+
+    # --- Example 1: A simple, digitally-born PDF ---
+    # (Create a dummy 'simple.pdf' for this to work)
+    try:
+        # Create a dummy simple PDF
+        from pypdf import PdfWriter
+
+        writer = PdfWriter()
+        writer.add_blank_page(width=612, height=792)
+        # pypdf's text addition is complex; a real file is better.
+        # This is a placeholder path.
+        SIMPLE_PDF = "simple_test.pdf"
+        # Assume 'simple_test.pdf' is a clean, 1-page digital PDF
+
+        print(f"\n--- Processing: {SIMPLE_PDF} (Simple PDF) ---")
+        result_simple = standard_extractor.extract(SIMPLE_PDF)
+        print(f"Extractor Used: {result_simple.extractor_used}")  # Should be 'pypdf'
+        print(f"Confidence: {result_simple.confidence_score}")
+        print(f"Text (first 200 chars): {result_simple.full_text[:200]}...")
+
+    except Exception as e:
+        print(f"Could not run simple PDF test: {e}")
+        print("Please create a 'simple_test.pdf' to run this example.")
+
+    # --- Example 2: A complex, academic PDF (requires Marker) ---
+    # (Requires a real PDF, e.g., 'arxiv_paper.pdf')
+    try:
+        # This is a placeholder path.
+        # Download an arXiv paper (e.g., "2308.13418.pdf" for Nougat)
+        # to test this path.
+        TECH_PDF = "arxiv_paper.pdf"
+
+        print(f"\n--- Processing: {TECH_PDF} (Technical PDF) ---")
+        result_tech = specialist_extractor.extract(TECH_PDF)
+        print(f"Extractor Used: {result_tech.extractor_used}")  # Should be 'marker'
+        print(f"Found {len(result_tech.headers)} headers.")
+        print(f"Found {len(result_tech.tables)} tables.")
+        print(f"Found {len(result_tech.equations)} equations.")
+
+        if result_tech.equations:
+            print("\nSample Equation (LaTeX):")
+            print(result_tech.equations.as_latex)
+
+    except Exception as e:
+        print(f"Could not run technical PDF test: {e}")
+        print(f"Please download an arXiv paper as '{TECH_PDF}' to run this example.")
 
