@@ -185,7 +185,7 @@ if __name__ == '__main__':
     """
 
     # Use non-semantic path to avoid requiring sentence-transformers
-    chunker = SemanticChunker(chunk_size=60, overlap=10, use_semantic_splits=False)
+    chunker = SemanticChunker(chunk_size=30, overlap=5, use_semantic_splits=False)
     chunks = chunker.chunk_document(sample, {"source": "test"})
     print(len(chunks))
     for i, ch in enumerate(chunks):
